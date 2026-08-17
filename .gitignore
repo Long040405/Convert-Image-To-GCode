@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary outputs & captures
+captures/*
+!captures/.gitkeep
+
+# G-code outputs
+*.gcode
+output/
+gcode/
+gcode_output/
+
+# Python Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
