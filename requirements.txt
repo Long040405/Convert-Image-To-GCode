@@ -3,5 +3,5 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 Pillow>=10.0.0
 
-# Basler GigE Camera SDK (Tùy chọn nếu dùng camera Basler)
+# Basler GigE Camera SDK (Optional when using physical Basler camera)
 pypylon>=3.0.0

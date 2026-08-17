@@ -1,24 +1,24 @@
 """
-G-Code Viewer — mở file .gcode và xem trước máy sẽ vẽ ra hình gì.
+G-Code Viewer — Open .gcode files and preview CNC / plotter toolpaths.
 
-Đây là chiều NGƯỢC LẠI của image_to_gcode.py: thay vì ảnh -> G-code,
-file này đọc G-code -> dựng lại nét vẽ để kiểm tra trước khi chạy máy thật.
+Reconstructs drawing paths from standard CNC G-Code instructions:
+  - G90/G91 (Absolute / Incremental positioning)
+  - G0/G1 (Rapid travel / Linear interpolation)
+  - G2/G3 (Clockwise / Counter-clockwise circular arcs with I/J or R parameters)
+  - Line numbers N10..., comments ';' and '(...)', modal F feed rates, skipped M-codes.
 
-Đọc được:
-  G90/G91 (tuyệt đối / tương đối), G0/G1 (thẳng), G2/G3 (cung tròn I/J hoặc R),
-  số dòng N10..., chú thích ';' và '(...)', F modal, lệnh M bỏ qua.
+Distinguishes Pen-Down (drawing) vs Pen-Up (rapid travel) via Z-axis height:
+  Z <= threshold = DRAWING, Z > threshold = RAPID TRAVEL.
+Threshold is auto-calculated as the midpoint between min and max Z in the file.
 
-Phân biệt nhấc/hạ bút theo trục Z: Z <= ngưỡng = ĐANG VẼ, Z > ngưỡng = di chuyển.
-Ngưỡng tự đoán = trung điểm giữa Z cao nhất và Z thấp nhất trong file
-(vd file nhấc Z0 / hạ Z-10 -> ngưỡng -5). Sửa tay được trong ô "Ngưỡng Z".
+Usage:
+    python gcode_viewer.py                    # Open GUI and click "Open File"
+    python gcode_viewer.py output.gcode
+    python gcode_viewer.py output.gcode --stats   # Print statistics only, no GUI
 
-Dùng:
-    python gcode_viewer.py                    # mở GUI rồi bấm "Mở file"
-    python gcode_viewer.py gcode/pikachu.gcode
-    python gcode_viewer.py gcode/pikachu.gcode --stats   # chỉ in thống kê, không mở GUI
-
-Chuột: lăn = phóng to/thu nhỏ tại con trỏ · kéo = di chuyển · nháy đúp = vừa khung.
-Phím:  Space = phát/dừng · F = vừa khung · R = phát lại từ đầu.
+Controls:
+    Mouse: Scroll = Zoom at cursor · Drag = Pan · Double-click = Fit to View.
+    Keys:  Space = Play/Pause · F = Fit to View · R = Replay from start.
 """
 
 import colorsys
@@ -32,19 +32,19 @@ from tkinter import filedialog, messagebox, ttk
 
 
 # ============================================================
-# ĐỌC G-CODE
+# G-CODE PARSER
 # ============================================================
 WORD_RE = re.compile(r'([A-Za-z])\s*([-+]?\d*\.?\d+)')
 NUM_RE = re.compile(r'^\s*[Nn]\d+')
 PAREN_RE = re.compile(r'\([^)]*\)')
 
-# Sai số tối đa khi bẻ cung tròn thành các đoạn thẳng (mm)
+# Maximum chord error when interpolating circular arcs to linear segments (mm)
 ARC_TOLERANCE = 0.02
 ARC_MAX_SEGMENTS = 720
 
 
 class Move:
-    """Một đoạn thẳng của đầu bút sau khi đã bẻ cung."""
+    """A linear segment of the toolpath after arc interpolation."""
     __slots__ = ('x0', 'y0', 'x1', 'y1', 'z', 'rapid', 'feed', 'line', 'draw')
 
     def __init__(self, x0, y0, x1, y1, z, rapid, feed, line):
@@ -54,7 +54,7 @@ class Move:
         self.rapid = rapid
         self.feed = feed
         self.line = line
-        self.draw = False        # gán sau, khi đã biết ngưỡng Z
+        self.draw = False
 
     @property
     def length(self):
@@ -62,7 +62,7 @@ class Move:
 
 
 def arc_points(x0, y0, x1, y1, cx, cy, clockwise):
-    """Bẻ cung tròn thành danh sách điểm (không gồm điểm đầu, gồm điểm cuối)."""
+    """Interpolates circular arc into discrete point sequence."""
     r = math.hypot(x0 - cx, y0 - cy)
     if r < 1e-9:
         return [(x1, y1)]
@@ -71,14 +71,12 @@ def arc_points(x0, y0, x1, y1, cx, cy, clockwise):
     a1 = math.atan2(y1 - cy, x1 - cx)
     sweep = a1 - a0
     if clockwise:
-        # G2: góc phải giảm dần -> sweep âm; trùng điểm đầu/cuối = vòng tròn đủ
         while sweep >= -1e-9:
             sweep -= 2 * math.pi
     else:
         while sweep <= 1e-9:
             sweep += 2 * math.pi
 
-    # số đoạn sao cho độ võng giữa dây cung và cung <= ARC_TOLERANCE
     if r > ARC_TOLERANCE:
         step_max = 2 * math.acos(max(-1.0, 1.0 - ARC_TOLERANCE / r))
     else:
@@ -90,16 +88,16 @@ def arc_points(x0, y0, x1, y1, cx, cy, clockwise):
     for k in range(1, n + 1):
         a = a0 + sweep * k / n
         pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    pts[-1] = (x1, y1)   # ép điểm cuối đúng bằng đích cho khỏi trôi
+    pts[-1] = (x1, y1)
     return pts
 
 
 def parse_gcode(text):
-    """G-code -> (moves, meta). Chưa gán cờ draw, xem apply_pen_threshold()."""
+    """Parses G-code text into moves and metadata."""
     x = y = z = 0.0
     feed = 0.0
     absolute = True
-    mode = None                  # G0/G1/G2/G3 modal
+    mode = None
     moves = []
     z_values = set()
     n_arcs = 0
@@ -119,7 +117,7 @@ def parse_gcode(text):
             if L == 'G':
                 gcodes.append(int(round(float(val))))
             elif L == 'M':
-                pass                      # M3/M5/M2... không ảnh hưởng quỹ đạo
+                pass
             else:
                 params[L] = float(val)
 
@@ -134,7 +132,6 @@ def parse_gcode(text):
         if 'F' in params:
             feed = params['F']
 
-        # Không có toạ độ nào -> dòng chỉ đặt chế độ/feed, không di chuyển
         if not any(k in params for k in ('X', 'Y', 'Z')):
             continue
         if mode is None:
@@ -152,7 +149,6 @@ def parse_gcode(text):
         if mode in (0, 1):
             moves.append(Move(x, y, nx, ny, nz, rapid, feed, lineno))
         else:
-            # --- cung tròn: tâm theo I/J (lệch so với điểm ĐẦU) hoặc bán kính R ---
             if 'I' in params or 'J' in params:
                 cx = x + params.get('I', 0.0)
                 cy = y + params.get('J', 0.0)
@@ -173,7 +169,7 @@ def parse_gcode(text):
             px, py = x, y
             pts = arc_points(x, y, nx, ny, cx, cy, clockwise=(mode == 2))
             for k, (ax, ay) in enumerate(pts, 1):
-                az = z + (nz - z) * k / len(pts)     # helix: Z nội suy đều
+                az = z + (nz - z) * k / len(pts)
                 moves.append(Move(px, py, ax, ay, az, rapid, feed, lineno))
                 px, py = ax, ay
 
@@ -191,7 +187,7 @@ def parse_gcode(text):
 
 
 def _center_from_radius(x0, y0, x1, y1, r, clockwise):
-    """Tâm cung khi G-code dùng R thay cho I/J. R<0 = chọn cung lớn."""
+    """Calculates arc center when radius R is specified."""
     dx, dy = x1 - x0, y1 - y0
     d = math.hypot(dx, dy)
     if d < 1e-9 or abs(r) < d / 2 - 1e-6:
@@ -204,30 +200,26 @@ def _center_from_radius(x0, y0, x1, y1, r, clockwise):
 
 
 def auto_pen_threshold(z_values):
-    """Ngưỡng nhấc/hạ bút tự đoán từ tập giá trị Z có trong file."""
+    """Estimates pen-down threshold from distinct Z values."""
     if not z_values:
         return 0.0
     lo, hi = min(z_values), max(z_values)
     if hi - lo < 1e-6:
-        return hi          # chỉ có 1 mức Z -> coi như vẽ hết
+        return hi
     return (lo + hi) / 2.0
 
 
 def apply_pen_threshold(moves, threshold):
-    """Gán cờ draw cho từng đoạn: hạ bút (Z <= ngưỡng) và không phải G0."""
+    """Assigns draw flag: pen down (Z <= threshold) and not rapid motion (G0)."""
     for m in moves:
         m.draw = (m.z <= threshold + 1e-9) and not m.rapid
 
 
 def build_strokes(moves):
-    """Gộp các đoạn liên tiếp cùng trạng thái bút thành 'nét'.
-
-    Đoạn chỉ chạy Z (không đổi X/Y) bị bỏ khỏi hình vẽ nhưng vẫn đổi trạng thái
-    bút cho đoạn sau — đó chính là lệnh nhấc/hạ bút.
-    """
+    """Groups consecutive motion segments with identical pen state into strokes."""
     strokes = []
     cur = None
-    seg_moves = []   # ánh xạ segment index → Move object
+    seg_moves = []
     for m in moves:
         if m.length < 1e-9:
             continue
@@ -248,8 +240,8 @@ def build_strokes(moves):
 def compute_stats(moves, strokes, total_seg):
     draw_d = travel_d = z_d = 0.0
     minutes = 0.0
-    xs, ys = [], []          # toàn bộ hành trình (gồm cả chạy không)
-    dxs, dys = [], []        # chỉ phần thực sự đặt bút xuống giấy
+    xs, ys = [], []
+    dxs, dys = [], []
     for m in moves:
         d = m.length
         if m.draw:
@@ -262,10 +254,9 @@ def compute_stats(moves, strokes, total_seg):
             minutes += d / m.feed
         xs.extend((m.x0, m.x1))
         ys.extend((m.y0, m.y1))
-    if not dxs:              # không có nét nào -> lấy tạm hành trình
+    if not dxs:
         dxs, dys = xs, ys
 
-    # quãng đường trục Z: cộng chênh lệch Z giữa các đoạn liên tiếp
     prev_z = 0.0
     for m in moves:
         z_d += abs(m.z - prev_z)
@@ -289,15 +280,14 @@ def compute_stats(moves, strokes, total_seg):
 
 
 # ============================================================
-# GIAO DIỆN
+# GUI INTERFACE
 # ============================================================
-# Mức TỐI ĐA của tỷ lệ giao diện; fit_ui_scale() tự hạ thêm nếu màn hình nhỏ.
 UI_SCALE = 0.78
 
-BASE_W, BASE_H = 1200, 820      # cỡ cửa sổ ở tỷ lệ 1.0
-MIN_W, MIN_H = 880, 560         # cỡ nhỏ nhất còn dùng được (ở tỷ lệ 1.0)
-SCREEN_USE_W = 0.94             # chỉ chiếm ngần này bề ngang màn hình
-SCREEN_USE_H = 0.88             # chừa chỗ cho taskbar + thanh tiêu đề
+BASE_W, BASE_H = 1200, 820
+MIN_W, MIN_H = 880, 560
+SCREEN_USE_W = 0.94
+SCREEN_USE_H = 0.88
 UI_SCALE_MIN = 0.55
 
 
@@ -310,7 +300,6 @@ def ui_font(size):
 
 
 def fit_ui_scale(root):
-    """Hạ UI_SCALE cho cửa sổ vừa màn hình thật (màn nhỏ / Windows phóng 125-150%)."""
     global UI_SCALE
     avail_w = root.winfo_screenwidth() * SCREEN_USE_W
     avail_h = root.winfo_screenheight() * SCREEN_USE_H
@@ -320,7 +309,6 @@ def fit_ui_scale(root):
 
 
 def place_window(root, w, h):
-    """Đặt cửa sổ cỡ w×h vào giữa màn hình, cắt bớt nếu vẫn còn quá khổ."""
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     w = min(w, int(sw * SCREEN_USE_W))
     h = min(h, int(sh * SCREEN_USE_H))
@@ -345,7 +333,7 @@ TRAVEL = "#45475a"
 
 
 def order_color(t):
-    """Màu theo thứ tự vẽ: xanh dương (đầu) -> xanh lá -> vàng -> đỏ (cuối)."""
+    """Generates color gradient by draw order: Blue -> Green -> Yellow -> Red."""
     r, g, b = colorsys.hsv_to_rgb(0.62 * (1.0 - t), 0.62, 1.0)
     return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
@@ -354,8 +342,7 @@ class GCodeViewer:
 
     def __init__(self, root, path=None):
         self.root = root
-        self.root.title("G-Code Viewer — xem trước nét vẽ")
-        # Co giao diện theo màn hình TRƯỚC khi dựng UI (ui_px/ui_font đọc UI_SCALE)
+        self.root.title("G-Code Viewer — Toolpath Visualizer")
         fit_ui_scale(self.root)
         win_w, win_h = place_window(self.root, ui_px(BASE_W), ui_px(BASE_H))
         self.root.minsize(min(ui_px(MIN_W), win_w), min(ui_px(MIN_H), win_h))
@@ -366,10 +353,9 @@ class GCodeViewer:
         self.meta = {}
         self.strokes = []
         self.total_seg = 0
-        self.seg_moves = []          # ánh xạ segment index → Move object
+        self.seg_moves = []
         self.stats = None
 
-        # khung nhìn: mm -> pixel
         self.scale = 3.0
         self.tx = 40.0
         self.ty = 40.0
@@ -377,15 +363,14 @@ class GCodeViewer:
 
         self.playing = False
         self._after_id = None
-        self._last_tick_time = None  # thời gian tick trước (time.perf_counter)
-        self._residual_mm = 0.0     # quãng đường dư chưa đủ 1 segment
-        self.pen_marker = None       # chỉ có sau lần _draw_strokes() đầu tiên
+        self._last_tick_time = None
+        self._residual_mm = 0.0
+        self.pen_marker = None
 
         self._build_ui()
         if path:
             self.load(path)
 
-    # ---------- dựng giao diện ----------
     def _build_ui(self):
         style = ttk.Style()
         style.theme_use("clam")
@@ -408,36 +393,35 @@ class GCodeViewer:
         main = ttk.Frame(self.root, padding=ui_px(8))
         main.pack(fill=tk.BOTH, expand=True)
 
-        # ---------- cột trái ----------
         left = ttk.Frame(main, width=ui_px(320))
         left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, ui_px(8)))
         left.pack_propagate(False)
 
         ttk.Label(left, text="G-Code Viewer", style="Header.TLabel").pack(anchor="w")
-        ttk.Label(left, text="Mở file .gcode để xem trước nét vẽ",
+        ttk.Label(left, text="Open a .gcode file to preview toolpaths",
                   wraplength=ui_px(300)).pack(anchor="w", pady=(0, ui_px(6)))
 
-        ttk.Button(left, text="Mở file .gcode", style="Accent.TButton",
+        ttk.Button(left, text="Open .gcode File", style="Accent.TButton",
                    command=self._open).pack(fill=tk.X, pady=2)
-        ttk.Button(left, text="Nạp lại file",
+        ttk.Button(left, text="Reload File",
                    command=self._reload).pack(fill=tk.X, pady=2)
 
-        self.file_label = ttk.Label(left, text="(chưa có file)", foreground=YELLOW,
+        self.file_label = ttk.Label(left, text="(no file loaded)", foreground=YELLOW,
                                     wraplength=ui_px(300))
         self.file_label.pack(anchor="w", pady=(ui_px(4), ui_px(6)))
 
-        # --- thông tin ---
-        inf = ttk.LabelFrame(left, text="Thông tin", padding=ui_px(6))
+        # Information frame
+        inf = ttk.LabelFrame(left, text="Information", padding=ui_px(6))
         inf.pack(fill=tk.X, pady=ui_px(4))
         self.info = tk.Text(inf, height=13, bg="#181825", fg=TEXT, bd=0,
                             font=("Consolas", ui_font(9)), wrap=tk.WORD,
                             highlightthickness=0)
         self.info.pack(fill=tk.X)
-        self.info.insert("1.0", "Chưa nạp file nào.")
+        self.info.insert("1.0", "No file loaded.")
         self.info.config(state=tk.DISABLED)
 
-        # --- hiển thị ---
-        disp = ttk.LabelFrame(left, text="Hiển thị", padding=ui_px(6))
+        # Display options frame
+        disp = ttk.LabelFrame(left, text="Display", padding=ui_px(6))
         disp.pack(fill=tk.X, pady=ui_px(4))
 
         self.v_travel = tk.BooleanVar(value=True)
@@ -445,30 +429,30 @@ class GCodeViewer:
         self.v_starts = tk.BooleanVar(value=False)
         self.v_grid = tk.BooleanVar(value=True)
         self.v_area = tk.BooleanVar(value=True)
-        for txt, var in (("Đường di chuyển (nhấc bút)", self.v_travel),
-                         ("Màu theo thứ tự vẽ", self.v_order),
-                         ("Chấm đầu mỗi nét", self.v_starts),
-                         ("Lưới 10 mm", self.v_grid),
-                         ("Khung vùng vẽ", self.v_area)):
+        for txt, var in (("Rapid moves (pen up)", self.v_travel),
+                         ("Color by draw order", self.v_order),
+                         ("Start point markers", self.v_starts),
+                         ("10 mm grid", self.v_grid),
+                         ("Work area boundary", self.v_area)):
             ttk.Checkbutton(disp, text=txt, variable=var,
                             command=self._rebuild).pack(anchor="w")
 
         row = ttk.Frame(disp)
         row.pack(fill=tk.X, pady=(ui_px(4), 0))
-        ttk.Label(row, text="Vùng vẽ (mm):").pack(side=tk.LEFT)
+        ttk.Label(row, text="Work area (mm):").pack(side=tk.LEFT)
         self.e_area_w = self._entry(row, "150", 5)
         ttk.Label(row, text="×").pack(side=tk.LEFT)
         self.e_area_h = self._entry(row, "150", 5)
 
         row = ttk.Frame(disp)
         row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text="Ngưỡng Z (hạ bút ≤):").pack(side=tk.LEFT)
+        ttk.Label(row, text="Z threshold (pen down ≤):").pack(side=tk.LEFT)
         self.e_thr = self._entry(row, "-5", 6)
-        ttk.Button(row, text="Áp dụng", width=8,
+        ttk.Button(row, text="Apply", width=8,
                    command=self._reapply_threshold).pack(side=tk.LEFT, padx=2)
 
-        # --- phát lại ---
-        play = ttk.LabelFrame(left, text="Phát lại thứ tự vẽ", padding=ui_px(6))
+        # Toolpath replay frame
+        play = ttk.LabelFrame(left, text="Replay Toolpath", padding=ui_px(6))
         play.pack(fill=tk.X, pady=ui_px(4))
 
         self.progress = tk.IntVar(value=0)
@@ -478,32 +462,30 @@ class GCodeViewer:
 
         row = ttk.Frame(play)
         row.pack(fill=tk.X, pady=ui_px(4))
-        self.play_btn = ttk.Button(row, text="Phát", command=self._toggle_play)
+        self.play_btn = ttk.Button(row, text="Play", command=self._toggle_play)
         self.play_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
         ttk.Button(row, text="|<", width=4, command=self._restart).pack(side=tk.LEFT, padx=1)
         ttk.Button(row, text=">|", width=4, command=self._to_end).pack(side=tk.LEFT, padx=1)
 
         row = ttk.Frame(play)
         row.pack(fill=tk.X)
-        ttk.Label(row, text="Tốc độ:").pack(side=tk.LEFT)
+        ttk.Label(row, text="Speed:").pack(side=tk.LEFT)
         self.speed = tk.DoubleVar(value=1.0)
         ttk.Scale(row, from_=1, to=50, orient=tk.HORIZONTAL,
                   variable=self.speed).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.speed_label = ttk.Label(row, text="1×", width=4)
         self.speed_label.pack(side=tk.LEFT, padx=2)
 
-        ttk.Button(left, text="Vừa khung (F)",
+        ttk.Button(left, text="Fit to View (F)",
                    command=self._fit).pack(fill=tk.X, pady=ui_px(4))
 
-        # ---------- canvas ----------
         right = ttk.Frame(main)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self.canvas = tk.Canvas(right, bg=CANVAS_BG, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        self.status = ttk.Label(right, text="Lăn chuột = phóng to · kéo = di chuyển "
-                                            "· nháy đúp = vừa khung",
+        self.status = ttk.Label(right, text="Scroll = Zoom · Drag = Pan · Double-click = Fit to View",
                                 foreground=GREEN)
         self.status.pack(anchor="w", pady=(ui_px(4), 0))
 
@@ -527,13 +509,12 @@ class GCodeViewer:
         e.pack(side=tk.LEFT, padx=2)
         return e
 
-    # ---------- nạp file ----------
     def _open(self):
         path = filedialog.askopenfilename(
-            title="Chọn file G-Code",
+            title="Select G-Code File",
             initialdir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "gcode"),
-            filetypes=[("G-Code", "*.gcode *.nc *.ngc *.tap"),
-                       ("Text", "*.txt"), ("Tất cả", "*.*")])
+            filetypes=[("G-Code files", "*.gcode *.nc *.ngc *.tap"),
+                       ("Text files", "*.txt"), ("All files", "*.*")])
         if path:
             self.load(path)
 
@@ -546,15 +527,15 @@ class GCodeViewer:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 text = f.read()
         except OSError as e:
-            messagebox.showerror("Lỗi", f"Không đọc được file:\n{e}")
+            messagebox.showerror("Error", f"Could not read file:\n{e}")
             return
 
         self._stop()
         self.path = path
         self.moves, self.meta = parse_gcode(text)
         if not self.moves:
-            messagebox.showwarning("Trống",
-                                   "Không tìm thấy lệnh di chuyển nào trong file.")
+            messagebox.showwarning("Empty",
+                                   "No motion commands found in file.")
             return
 
         thr = auto_pen_threshold(self.meta['z_values'])
@@ -569,7 +550,7 @@ class GCodeViewer:
         try:
             thr = float(self.e_thr.get())
         except ValueError:
-            messagebox.showerror("Lỗi", "Ngưỡng Z phải là số.")
+            messagebox.showerror("Error", "Z threshold must be a valid number.")
             return
         if self.moves:
             self._apply(thr)
@@ -590,35 +571,34 @@ class GCodeViewer:
         w = s['dxmax'] - s['dxmin']
         h = s['dymax'] - s['dymin']
         txt = (
-            f"Đoạn thẳng   : {s['n_moves']}\n"
-            f"Nét vẽ       : {s['n_strokes']}\n"
-            f"Lần nhấc bút : {s['n_travel']}\n"
-            f"Cung G2/G3   : {self.meta['n_arcs']}\n"
+            f"Linear moves : {s['n_moves']}\n"
+            f"Draw strokes : {s['n_strokes']}\n"
+            f"Pen hops (G0): {s['n_travel']}\n"
+            f"Arcs G2/G3   : {self.meta['n_arcs']}\n"
             f"\n"
-            f"Khổ hình vẽ  : {w:.1f} × {h:.1f} mm\n"
-            f"X (nét vẽ)   : {s['dxmin']:.1f} … {s['dxmax']:.1f}\n"
-            f"Y (nét vẽ)   : {s['dymin']:.1f} … {s['dymax']:.1f}\n"
-            f"Cả hành trình: X {s['xmin']:.1f}…{s['xmax']:.1f}"
+            f"Drawing size : {w:.1f} × {h:.1f} mm\n"
+            f"X (draw)     : {s['dxmin']:.1f} … {s['dxmax']:.1f}\n"
+            f"Y (draw)     : {s['dymin']:.1f} … {s['dymax']:.1f}\n"
+            f"Total travel : X {s['xmin']:.1f}…{s['xmax']:.1f}"
             f"  Y {s['ymin']:.1f}…{s['ymax']:.1f}\n"
-            f"Các mức Z    : {zs}\n"
-            f"Ngưỡng hạ bút: Z ≤ {threshold:g}\n"
+            f"Z levels     : {zs}\n"
+            f"Pen-down thr : Z ≤ {threshold:g}\n"
             f"\n"
-            f"Đường vẽ     : {s['draw_dist']:.1f} mm\n"
-            f"Đường chạy   : {s['travel_dist']:.1f} mm\n"
-            f"Trục Z       : {s['z_dist']:.1f} mm\n"
-            f"Ước tính     : {s['minutes']:.1f} phút"
+            f"Draw distance: {s['draw_dist']:.1f} mm\n"
+            f"Rapid travel : {s['travel_dist']:.1f} mm\n"
+            f"Z travel     : {s['z_dist']:.1f} mm\n"
+            f"Est. time    : {s['minutes']:.1f} min"
         )
         if self.meta['bad_lines']:
             n = len(self.meta['bad_lines'])
             first = ", ".join(str(x) for x in self.meta['bad_lines'][:5])
-            txt += f"\n\n[!] {n} dòng không hiểu (dòng {first}…)"
+            txt += f"\n\n[!] {n} unparsed lines (lines {first}…)"
 
         self.info.config(state=tk.NORMAL)
         self.info.delete("1.0", tk.END)
         self.info.insert("1.0", txt)
         self.info.config(state=tk.DISABLED)
 
-    # ---------- toạ độ ----------
     def _to_screen(self, x, y):
         return x * self.scale + self.tx, -y * self.scale + self.ty
 
@@ -642,7 +622,6 @@ class GCodeViewer:
         w = max(xmax - xmin, 1e-6)
         h = max(ymax - ymin, 1e-6)
 
-        # cửa sổ chưa map thì winfo_* trả về 1 -> chặn dưới để khỏi chia cho 0
         avail_w = max(cw - 2 * pad, ui_px(20))
         avail_h = max(ch - 2 * pad, ui_px(20))
         self.scale = max(min(avail_w / w, avail_h / h), 1e-3)
@@ -650,7 +629,6 @@ class GCodeViewer:
         self.ty = ch - pad + ymin * self.scale
         self._rebuild()
 
-    # ---------- vẽ ----------
     def _rebuild(self):
         self.canvas.delete("all")
         for st in self.strokes:
@@ -671,7 +649,7 @@ class GCodeViewer:
             x0, y0 = self._to_mm(0, ch)
             x1, y1 = self._to_mm(cw, 0)
             step = 10.0
-            while (step * self.scale) < ui_px(8):     # lưới dày quá thì thưa ra
+            while (step * self.scale) < ui_px(8):
                 step *= 5
             gx = math.floor(x0 / step) * step
             while gx <= x1:
@@ -693,7 +671,8 @@ class GCodeViewer:
             self.canvas.create_text(ax0 + 4, ay0 - 4, anchor="sw",
                                     text=f"{aw:g} × {ah:g} mm", fill=AREA,
                                     font=("Segoe UI", ui_font(8)))
-        # gốc toạ độ
+
+        # Origin point (0, 0)
         ox, oy = self._to_screen(0, 0)
         self.canvas.create_line(ox - 7, oy, ox + 7, oy, fill=RED)
         self.canvas.create_line(ox, oy - 7, ox, oy + 7, fill=RED)
@@ -735,7 +714,7 @@ class GCodeViewer:
                                                   width=2, state="hidden")
 
     def _apply_progress(self):
-        """Chỉ hiện phần quỹ đạo đã chạy tới vị trí thanh trượt."""
+        """Displays toolpath up to current slider progress."""
         p = self.progress.get()
         pen_xy = None
         for st in self.strokes:
@@ -770,7 +749,6 @@ class GCodeViewer:
         else:
             self.canvas.itemconfigure(self.pen_marker, state="hidden")
 
-    # ---------- tương tác ----------
     def _on_slider(self, _val):
         if not self.strokes:
             return
@@ -789,7 +767,7 @@ class GCodeViewer:
             self.playing = True
             self._last_tick_time = None
             self._residual_mm = 0.0
-            self.play_btn.config(text="Dừng")
+            self.play_btn.config(text="Pause")
             self._tick()
 
     def _stop(self):
@@ -798,7 +776,7 @@ class GCodeViewer:
         if self._after_id:
             self.root.after_cancel(self._after_id)
             self._after_id = None
-        self.play_btn.config(text="Phát")
+        self.play_btn.config(text="Play")
 
     def _tick(self):
         if not self.playing:
@@ -812,38 +790,30 @@ class GCodeViewer:
 
         dt = now - self._last_tick_time
         self._last_tick_time = now
-        # Giới hạn dt để tránh nhảy quá xa khi cửa sổ bị treo/lag
         dt = min(dt, 0.1)
 
         multiplier = max(1.0, self.speed.get())
         self.speed_label.config(text=f"{multiplier:.0f}×")
 
         p = self.progress.get()
-        # Tích luỹ quãng đường di chuyển dựa trên feed rate thực
-        # dt (giây) × feed (mm/phút) / 60 = mm di chuyển
-        # Duyệt từng segment, trừ dần quãng đường còn lại
         budget_mm = self._residual_mm
 
         while p < self.total_seg:
             if p < len(self.seg_moves):
                 mv = self.seg_moves[p]
                 seg_len = mv.length
-                # Feed rate tối thiểu 800 mm/min, tránh segment đứng yên
                 feed = max(800.0, mv.feed) if mv.feed > 0 else 800.0
             else:
                 seg_len = 0.001
                 feed = 800.0
 
-            # Quãng đường có thể đi trong khoảng dt này
             mm_this_tick = feed / 60.0 * dt * multiplier
             budget_mm += mm_this_tick
 
             if budget_mm >= seg_len:
                 budget_mm -= seg_len
                 p += 1
-                # Sau khi xong 1 segment, reset dt cho các segment tiếp theo
-                # (chúng tiêu thụ từ budget_mm tích luỹ)
-                dt = 0  # các segment tiếp dùng budget_mm dư
+                dt = 0
             else:
                 break
 
@@ -873,7 +843,6 @@ class GCodeViewer:
             f = 1 / 1.15
         else:
             f = 1.15
-        # giữ nguyên điểm dưới con trỏ khi phóng to
         self.tx = e.x - (e.x - self.tx) * f
         self.ty = e.y - (e.y - self.ty) * f
         self.scale *= f
@@ -894,38 +863,38 @@ class GCodeViewer:
         mx, my = self._to_mm(e.x, e.y)
         extra = ""
         if self.total_seg:
-            extra = f"   |   đoạn {self.progress.get()}/{self.total_seg}"
+            extra = f"   |   segment {self.progress.get()}/{self.total_seg}"
         self.status.config(text=f"X = {mx:7.2f} mm    Y = {my:7.2f} mm"
                                 f"    (zoom {self.scale:.2f}×){extra}")
 
 
 # ============================================================
-# CLI
+# CLI ENTRY POINT
 # ============================================================
 def print_stats(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         moves, meta = parse_gcode(f.read())
     if not moves:
-        print("Không có lệnh di chuyển nào.")
+        print("No motion commands found in file.")
         return
     thr = auto_pen_threshold(meta['z_values'])
     apply_pen_threshold(moves, thr)
     strokes, total, _seg_moves = build_strokes(moves)
     s = compute_stats(moves, strokes, total)
     print(f"File          : {path}")
-    print(f"Đoạn thẳng    : {s['n_moves']}  (cung G2/G3: {meta['n_arcs']})")
-    print(f"Nét vẽ        : {s['n_strokes']}   | lần nhấc bút: {s['n_travel']}")
-    print(f"Các mức Z     : {', '.join(f'{z:g}'for z in meta['z_values'])}"
-          f"  -> ngưỡng hạ bút Z <= {thr:g}")
-    print(f"Khổ hình vẽ   : {s['dxmax'] - s['dxmin']:.1f} x {s['dymax'] - s['dymin']:.1f} mm"
+    print(f"Linear moves  : {s['n_moves']}  (G2/G3 arcs: {meta['n_arcs']})")
+    print(f"Draw strokes  : {s['n_strokes']}   | Pen hops: {s['n_travel']}")
+    print(f"Z levels      : {', '.join(f'{z:g}' for z in meta['z_values'])}"
+          f"  -> Pen-down threshold Z <= {thr:g}")
+    print(f"Drawing size  : {s['dxmax'] - s['dxmin']:.1f} x {s['dymax'] - s['dymin']:.1f} mm"
           f"   X {s['dxmin']:.1f}..{s['dxmax']:.1f}   Y {s['dymin']:.1f}..{s['dymax']:.1f}")
-    print(f"Cả hành trình : X {s['xmin']:.1f}..{s['xmax']:.1f}"
+    print(f"Total travel  : X {s['xmin']:.1f}..{s['xmax']:.1f}"
           f"   Y {s['ymin']:.1f}..{s['ymax']:.1f}")
-    print(f"Đường vẽ      : {s['draw_dist']:.1f} mm | chạy không: {s['travel_dist']:.1f} mm"
-          f" | trục Z: {s['z_dist']:.1f} mm")
-    print(f"Ước tính      : {s['minutes']:.1f} phút")
+    print(f"Draw distance : {s['draw_dist']:.1f} mm | Rapid travel: {s['travel_dist']:.1f} mm"
+          f" | Z travel: {s['z_dist']:.1f} mm")
+    print(f"Est. time     : {s['minutes']:.1f} min")
     if meta['bad_lines']:
-        print(f"[!] Dòng không hiểu: {meta['bad_lines'][:10]}")
+        print(f"[!] Unparsed lines: {meta['bad_lines'][:10]}")
 
 
 def main():
@@ -937,7 +906,7 @@ def main():
 
     if stats_only:
         if not path:
-            print("Cần đường dẫn file: python gcode_viewer.py file.gcode --stats")
+            print("File path required: python gcode_viewer.py file.gcode --stats")
             return
         print_stats(path)
         return

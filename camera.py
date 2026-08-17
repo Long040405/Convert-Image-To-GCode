@@ -6,105 +6,92 @@ import sys
 import time
 from datetime import datetime
 
-# Thiết lập UTF-8 stdout trên Windows terminal
+# Set UTF-8 stdout on Windows terminal
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
         pass
 
-# Biến toàn cục lưu cài đặt
-UI_SCALE = 0.5             # TỶ LỆ KHUNG HIỂN THỊ UI (Thay đổi ở đây: 0.3 = 30%, 0.5 = 50%, 0.7 = 70%)
-                           # Đây là mức TỐI ĐA — fit_display() tự thu nhỏ thêm
-                           # nếu cửa sổ vượt ra ngoài màn hình.
-SCREEN_USE = 0.85          # cửa sổ chỉ chiếm tối đa 85% màn hình
-TRACKBAR_H = 190           # chiều cao 4 thanh trượt + thanh tiêu đề (px), phải trừ ra
-current_exposure_ms = 42   # 42ms phơi sáng thủ công (thanh trượt tối đa 100)
-current_gain = 10          # Gain (dB) (thanh trượt tối đa 24)
-auto_exposure_enabled = 0  # 0 = TẮT TỰ ĐỘNG PHƠI SÁNG
-color_mode_idx = 3         # Mặc định = 3 (BayerGR2BGR)
-live_sharpen_level = 2     # Nấc làm nét bằng phần mềm trên luồng Live (0 = Tắt, 1-5 = Tăng độ nét kỹ thuật số)
+# Global UI and Camera settings
+UI_SCALE = 0.5             # UI display scale factor (0.3 = 30%, 0.5 = 50%, 0.7 = 70%)
+                           # Maximum upper bound — fit_display() auto-downscales further
+                           # if the window exceeds screen dimensions.
+SCREEN_USE = 0.85          # Window occupies at most 85% of screen
+TRACKBAR_H = 190           # Height of 4 trackbars + title bar (px)
+current_exposure_ms = 42   # 42ms manual exposure (slider max: 100)
+current_gain = 10          # Gain (dB) (slider max: 24)
+auto_exposure_enabled = 0  # 0 = Auto Exposure Disabled
+color_mode_idx = 3         # Default = 3 (BayerGR2BGR)
+live_sharpen_level = 2     # Software sharpening level on Live stream (0 = Off, 1-5 = Digital sharpness level)
 
-# ===== CẤU HÌNH CHỤP ẢNH (CAPTURE) =====
+# ===== CAPTURE CONFIGURATION =====
 CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
-CAPTURE_AVG_FRAMES = 3     # Số khung hình gộp trung bình để khử nhiễu khi chụp (đặt = 1 để tắt)
-CLAHE_CLIP = 2.0           # Độ mạnh tăng tương phản cục bộ
-UNSHARP_SIGMA = 1.2        # Bán kính mặt nạ làm nét (px)
+CAPTURE_AVG_FRAMES = 3     # Number of frames averaged for temporal noise reduction (set 1 to disable)
+CLAHE_CLIP = 2.0           # Local contrast enhancement clip limit
+UNSHARP_SIGMA = 1.2        # Sharpening mask radius (px)
 
-# ===== CẤU HÌNH TÁCH VẬT KHỎI NỀN (để cắt G-Code cho sạch) =====
-# Vấn đề: chụp trên giấy trắng thì BÓNG ĐỔ quanh vật cũng tối, image_to_gcode
-# cắt ngưỡng độ sáng sẽ vẽ luôn cả bóng; còn tăng đèn cho hết bóng thì vật bị
-# cháy sáng, mất nét. Cách xử lý: dựa vào MÀU (bóng đổ gần như không đổi màu,
-# chỉ đổi độ sáng) cộng với việc san phẳng ánh sáng nền, rồi dán vật lên nền
-# TRẮNG TINH -> ảnh vào G-Code chỉ còn đúng vật.
-EXTRACT_OBJECT = True      # False = tắt, chỉ lưu ảnh làm nét
-OBJ_CHROMA_THR = 10.0      # Lệch màu so với nền (LAB a/b) > ngưỡng = VẬT.
-                           #   Vật màu nhạt không bắt được -> GIẢM (6–8)
-                           #   Bắt nhầm nền ngả vàng          -> TĂNG (14–18)
-OBJ_DARK_RATIO = 0.72      # Tối hơn nền còn < 72% = VẬT (bắt vật đen/xám).
-                           #   Bóng đổ bị vẽ theo -> GIẢM (0.6)
-                           #   Vật tối bị bỏ sót  -> TĂNG (0.8)
-OBJ_MIN_AREA_RATIO = 0.001  # Bỏ mảng nhỏ hơn 0.1% diện tích ảnh (nhiễu, vết bẩn)
-OBJ_USE_GRABCUT = True     # Tinh chỉnh biên bằng GrabCut (chậm thêm ~0.5s)
-OBJ_FEATHER = 1.0          # Làm mềm biên khi dán (px), 0 = cắt sắc cạnh
-OBJ_CROP_MARGIN = 20       # Cắt sát vật, chừa lề (px). Đặt -1 để giữ nguyên khung
+# ===== OBJECT SEGMENTATION CONFIGURATION (Clean background for G-Code) =====
+# Problem: On white paper, cast shadows around physical objects are dark. If thresholded
+# directly by luminance, G-Code will draw the shadows too. Increasing lighting burns highlights.
+# Solution: Separate using chrominance (shadows change brightness, not hue), level background
+# illumination, and paste object onto pure white background.
+EXTRACT_OBJECT = True      # False = Disable object isolation, save sharpened frame only
+OBJ_CHROMA_THR = 10.0      # Color divergence from background (LAB a/b) > threshold = OBJECT
+                           #   Pale objects missed    -> DECREASE (6–8)
+                           #   Yellowish background captured -> INCREASE (14–18)
+OBJ_DARK_RATIO = 0.72      # Darker than background < 72% = OBJECT (catches black/gray objects)
+                           #   Cast shadows captured  -> DECREASE (0.6)
+                           #   Dark objects missed    -> INCREASE (0.8)
+OBJ_MIN_AREA_RATIO = 0.001  # Discard blobs smaller than 0.1% of image area (noise, dust)
+OBJ_USE_GRABCUT = True     # Refine contours with GrabCut (~0.5s additional processing)
+OBJ_FEATHER = 1.0          # Alpha feather radius at boundary (px), 0 = sharp cut
+OBJ_CROP_MARGIN = 20       # Tight crop margin around object (px). Set -1 to keep original frame
 
-# ===== KHỬ BÓNG ĐỔ QUANH VẬT =====
-# Bóng đổ là nền BỊ MỜ ĐI chứ không phải vật: nó chỉ hạ độ sáng, gần như không
-# đổi sắc độ. Cách khử: dựng "trường ánh sáng" của riêng tấm ảnh đó — che vùng
-# vật lại, trám chỗ che bằng nội suy từ xung quanh rồi làm mượt. Bóng biến thiên
-# trơn nên nằm gọn trong trường này; đem ảnh chia cho trường thì bóng biến mất,
-# chỉ còn thứ thật sự tối hơn môi trường ngay quanh nó = vật.
-# Vùng vật để che lấy từ dấu hiệu MÀU (bóng không đổi màu nên không bao giờ lọt
-# vào mồi) cộng với vùng tối đậm chắc chắn không phải bóng.
-REMOVE_SHADOW = True       # False = tắt, quay về cách cũ
-SHADOW_SEED_RATIO = 0.45   # Tối hơn 45% so với nền = chắc chắn VẬT, dùng làm mồi.
-                           #   Bóng quá đậm vẫn bị vẽ -> GIẢM (0.3–0.4)
-                           #   Vật xám đậm bị ăn mất  -> TĂNG (0.55–0.6)
-SHADOW_SMOOTH = 9.0        # Độ mượt của trường sáng (px, đo trên ảnh thu nhỏ 512).
-                           #   Bóng viền còn sót     -> TĂNG chậm (11–14)
-                           #   Vật to bị coi là nền  -> GIẢM (6–7)
+# ===== CAST SHADOW ELIMINATION =====
+# Shadows are dimmed background rather than physical objects (lower luminance, unchanged chrominance).
+# Solution: Construct an illumination field — mask the object seed, interpolate background, and smooth.
+# Dividing the image by this field eliminates diffuse shadows while retaining true object boundaries.
+REMOVE_SHADOW = True       # False = Disable shadow removal
+SHADOW_SEED_RATIO = 0.45   # Darker than 45% of background = definite OBJECT seed
+                           #   Dark shadows captured -> DECREASE (0.3–0.4)
+                           #   Dark gray objects eroded -> INCREASE (0.55–0.6)
+SHADOW_SMOOTH = 9.0        # Smoothness of light field (px, evaluated on 512px downscaled image)
+                           #   Residual shadow edges -> INCREASE slowly (11–14)
+                           #   Large objects treated as bg -> DECREASE (6–7)
 
-# ===== HOẠT HÌNH HOÁ (CARTOON) =====
-# Ảnh chụp thật có chuyển sắc mượt + vân bề mặt + nhiễu cảm biến. image_to_gcode
-# cắt theo ngưỡng độ sáng nên chỗ chuyển sắc từ từ biến thành hàng trăm nét vụn,
-# bút nhấc lên hạ xuống liên tục mà hình vẫn rối. Hoạt hình hoá gom ảnh về vài
-# MẢNG MÀU PHẲNG + NÉT VIỀN rõ ràng — đúng thứ máy vẽ nét cần.
-# Nét viền lấy từ RANH GIỚI các mảng màu, KHÔNG dùng ngưỡng thích nghi trên ảnh
-# xám: cách đó rắc đầy đốm nhiễu lên vùng phẳng, đo ra còn nhiều nét vụn hơn cả
-# ảnh gốc. Ranh giới mảng màu thì kín và sạch sẵn.
-CARTOON = True             # Tạo thêm file *_cartoon.png sau mỗi lần chụp
-CARTOON_LEVELS = 6         # Số mức màu sau khi gom. Ít = phẳng/đơn giản, nhiều = giữ chi tiết
-CARTOON_SMOOTH = 2         # Số lần lọc song phương (xoá vân nhưng giữ nguyên biên)
-CARTOON_CLEAN = 9          # Cỡ cửa sổ dọn đốm trên bản đồ màu (số LẺ).
-                           #   Còn nhiều nét vụn -> TĂNG (11–15)
-                           #   Mất chi tiết nhỏ  -> GIẢM (5–7)
-CARTOON_MIN_AREA = 60      # Xoá hẳn mảng màu nhỏ hơn ngần này px
-CARTOON_EDGE_THICK = 1     # Độ dày nét viền (px)
-CARTOON_WORK = 1000        # Cỡ ảnh khi xử lý nặng (px cạnh dài) — lớn hơn = chậm hơn
+# ===== CARTOONIZATION CONFIGURATION =====
+# Raw photos contain continuous gradients and sensor noise that generate fragmented toolpaths.
+# Cartoonization quantizes images into discrete flat color regions with crisp boundary strokes.
+CARTOON = True             # Generate *_cartoon.png after capture
+CARTOON_LEVELS = 6         # Number of quantized color clusters (fewer = simpler, more = retains detail)
+CARTOON_SMOOTH = 2         # Bilateral filter iterations (removes surface texture while keeping edges)
+CARTOON_CLEAN = 9          # Median filter window for speckle removal on color map (odd integer)
+                           #   Fragmented lines remain -> INCREASE (11–15)
+                           #   Fine details lost       -> DECREASE (5–7)
+CARTOON_MIN_AREA = 60      # Discard color patches smaller than this area (px)
+CARTOON_EDGE_THICK = 1     # Edge outline thickness (px)
+CARTOON_WORK = 1000        # Processing resolution (px long edge)
 
-# ===== SAN PHẲNG ÁNH SÁNG NỀN (FLAT-FIELD) =====
-# Vấn đề: đèn chiếu lệch + ống kính tối 4 góc (vignetting) làm tấm nền trắng chỗ
-# sáng chỗ xám. image_to_gcode cắt theo ĐỘ SÁNG nên góc tối bị vẽ thành nét, còn
-# vật ở vùng sáng thì mất nét.
-# Cách chuẩn: chụp MỘT lần tấm nền trắng TRỐNG (phím 'f') làm bản đồ sáng, mọi
-# ảnh sau đều được chia cho bản đồ đó -> nền phẳng đều, đúng cả sai lệch màu đèn.
-FLATTEN_ILLUM = True       # False = tắt hẳn phần san phẳng
+# ===== FLAT-FIELD ILLUMINATION LEVELING =====
+# Uneven lighting and lens vignetting cause false contours on white backgrounds.
+# Flat-field calibration divides subsequent frames by an empty white reference image.
+FLATTEN_ILLUM = True       # False = Disable illumination leveling
 FLATFIELD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flatfield.png")
-FLATFIELD_BLUR = 21        # Làm mượt bản đồ sáng (px) để không in nhiễu/bụi vào ảnh
-FLATFIELD_MAX_GAIN = 4.0   # Chặn hệ số nhân, tránh khuếch đại nhiễu ở góc quá tối
-AUTO_FLATTEN = True        # Chưa có file tham chiếu thì tự ước lượng nền từ chính ảnh
-AUTO_MAX_GAIN = 2.2        # Chặn hệ số khi tự ước lượng (thấp hơn vì kém chắc chắn)
-WHITEN_BG = True           # Kéo nền về trắng tinh sau khi đã san phẳng
-WHITEN_PCT = 92            # Phân vị độ sáng coi là "nền" (92% ảnh là nền trắng)
-WHITEN_MAX_GAIN = 1.6      # Chặn mức kéo sáng, tránh cháy mất chi tiết vật
+FLATFIELD_BLUR = 21        # Smoothing radius for light map (px) to prevent dust transfer
+FLATFIELD_MAX_GAIN = 4.0   # Maximum gain clamp to prevent noise amplification in corners
+AUTO_FLATTEN = True        # Auto-estimate background if reference file is absent
+AUTO_MAX_GAIN = 2.2        # Gain clamp for automatic estimation
+WHITEN_BG = True           # Pull leveled background to pure white (255)
+WHITEN_PCT = 92            # Luminance percentile treated as background
+WHITEN_MAX_GAIN = 1.6      # Gain clamp for background whitening
 
-# Danh sách các chế độ giải mã màu Bayer trong OpenCV
+# List of Bayer color demosaicing modes in OpenCV
 BAYER_MODES = [
     ("BayerBG2BGR", cv2.COLOR_BayerBG2BGR),
     ("BayerGB2BGR", cv2.COLOR_BayerGB2BGR),
     ("BayerRG2BGR", cv2.COLOR_BayerRG2BGR),
-    ("BayerGR2BGR", cv2.COLOR_BayerGR2BGR),  # MODE 3 CHUẨN MẶC ĐỊNH
+    ("BayerGR2BGR", cv2.COLOR_BayerGR2BGR),  # MODE 3 DEFAULT STANDARD
     ("BayerBG2RGB", cv2.COLOR_BayerBG2RGB),
     ("BayerGB2RGB", cv2.COLOR_BayerGB2RGB),
     ("BayerRG2RGB", cv2.COLOR_BayerRG2RGB),
@@ -115,7 +102,7 @@ _screen_cache = None
 
 
 def screen_size():
-    """Cỡ màn hình (px). Không hỏi được thì tạm coi là 1920x1080."""
+    """Returns screen resolution (px). Falls back to 1920x1080 if unavailable."""
     global _screen_cache
     if _screen_cache is None:
         _screen_cache = (1920, 1080)
@@ -132,12 +119,7 @@ def screen_size():
 
 
 def fit_display(img, scale=None, chrome_h=TRACKBAR_H):
-    """Thu nhỏ ảnh để cửa sổ hiển thị KHÔNG tràn ra ngoài màn hình.
-
-    Cảm biến của Basler lớn (vài nghìn px), nhân UI_SCALE cố định vẫn có thể cao
-    hơn màn hình — cộng thêm mấy thanh trượt nữa là mất luôn mép dưới. Ở đây lấy
-    tỷ lệ nhỏ nhất giữa UI_SCALE và tỷ lệ vừa-màn-hình.
-    """
+    """Downscales image to ensure the window fits comfortably on screen."""
     h, w = img.shape[:2]
     sw, sh = screen_size()
     s = min(scale if scale is not None else UI_SCALE,
@@ -154,24 +136,29 @@ def on_exposure_change(val):
     global current_exposure_ms
     current_exposure_ms = max(1, val)
 
+
 def on_gain_change(val):
     global current_gain
     current_gain = val
+
 
 def on_auto_exposure_change(val):
     global auto_exposure_enabled
     auto_exposure_enabled = val
 
+
 def on_color_mode_change(val):
     global color_mode_idx
     color_mode_idx = val % len(BAYER_MODES)
+
 
 def on_sharpen_change(val):
     global live_sharpen_level
     live_sharpen_level = val
 
+
 def imwrite_unicode(path, img):
-    """Ghi ảnh an toàn kể cả khi đường dẫn có ký tự tiếng Việt (cv2.imwrite bị lỗi trên Windows)."""
+    """Safe image write supporting Unicode/special characters in file paths on Windows."""
     ext = os.path.splitext(path)[1] or ".png"
     ok, buf = cv2.imencode(ext, img)
     if ok:
@@ -180,7 +167,7 @@ def imwrite_unicode(path, img):
 
 
 def raw_to_bgr(img, cv2_bayer_code):
-    """Chuyển mảng ảnh thô từ camera (mono/Bayer, 8 hoặc 12/16-bit) sang ảnh BGR 8-bit."""
+    """Converts raw camera buffer (mono/Bayer, 8 or 12/16-bit) to 8-bit BGR image."""
     if img.dtype != np.uint8:
         img_8u = (img >> 4).astype(np.uint8) if img.dtype == np.uint16 else img.astype(np.uint8)
     else:
@@ -192,21 +179,21 @@ def raw_to_bgr(img, cv2_bayer_code):
 
 
 def sharpness_score(img_bgr):
-    """Điểm độ nét (phương sai Laplacian) - càng cao càng nét."""
+    """Laplacian variance score — higher value indicates sharper focus."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def enhance_image(img_bgr):
     """
-    Tự động làm rõ nét ảnh sau khi chụp:
-      1. Lọc song phương (bilateral) khử nhiễu nhưng giữ nguyên cạnh.
-      2. CLAHE trên kênh L (LAB) tăng tương phản cục bộ, làm nổi đường nét.
-      3. Unsharp mask với cường độ TỰ ĐỘNG theo độ nét gốc của ảnh.
+    Automated post-capture enhancement pipeline:
+      1. Bilateral filtering for edge-preserving denoising.
+      2. CLAHE on L channel (LAB) for local contrast enhancement.
+      3. Adaptive unsharp masking proportional to initial sharpness.
     """
     score = sharpness_score(img_bgr)
 
-    # Ảnh càng mờ thì đẩy cường độ làm nét càng mạnh
+    # Blurrier images receive stronger sharpening compensation
     if score < 50:
         amount = 1.6
     elif score < 150:
@@ -216,16 +203,16 @@ def enhance_image(img_bgr):
     else:
         amount = 0.5
 
-    # 1. Khử nhiễu giữ cạnh
+    # 1. Edge-preserving denoising
     den = cv2.bilateralFilter(img_bgr, 7, 50, 50)
 
-    # 2. Tăng tương phản cục bộ trên kênh sáng
+    # 2. Local contrast enhancement on luminance channel
     lab = cv2.cvtColor(den, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     l = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(8, 8)).apply(l)
     den = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
-    # 3. Unsharp mask: ảnh gốc + (ảnh gốc - ảnh mờ) * amount
+    # 3. Unsharp masking: original + (original - blurred) * amount
     blur = cv2.GaussianBlur(den, (0, 0), UNSHARP_SIGMA)
     sharp = cv2.addWeighted(den, 1.0 + amount, blur, -amount, 0)
 
@@ -233,26 +220,23 @@ def enhance_image(img_bgr):
 
 
 # ============================================================
-# SAN PHẲNG ÁNH SÁNG NỀN
+# FLAT-FIELD ILLUMINATION CORRECTION
 # ============================================================
-_ff_gain = None            # bản đồ hệ số nhân từ file tham chiếu (float32, BGR)
-_ff_tried = False          # đã thử đọc file chưa (khỏi đọc lại mỗi khung hình)
-_ff_resized = {}           # (h, w) -> bản đồ đã co về cỡ đó
+_ff_gain = None            # Gain map from reference file (float32, BGR)
+_ff_tried = False          # File read flag (avoids redundant disk I/O)
+_ff_resized = {}           # (h, w) -> Resized gain map cache
 
 
 def _gain_from_reference(ref_bgr):
-    """Từ ảnh nền trắng trống -> bản đồ hệ số nhân đưa mọi điểm về cùng độ sáng.
-
-    Chia theo TỪNG KÊNH màu nên sửa luôn được ánh đèn ngả vàng/xanh.
-    """
+    """Generates per-channel gain map from an empty white reference image."""
     ref = cv2.GaussianBlur(ref_bgr.astype(np.float32), (0, 0), FLATFIELD_BLUR)
     ref = np.maximum(ref, 1.0)
-    target = float(np.percentile(ref, 98))     # chỗ sáng nhất của nền = mốc trắng
+    target = float(np.percentile(ref, 98))     # Brightest region of background = white reference
     return np.clip(target / ref, 0.2, FLATFIELD_MAX_GAIN).astype(np.float32)
 
 
 def load_flatfield():
-    """Nạp bản đồ sáng từ file (nạp một lần rồi nhớ luôn). None = chưa có file."""
+    """Loads gain map from reference file (cached in memory). Returns None if absent."""
     global _ff_gain, _ff_tried
     if not _ff_tried:
         _ff_tried = True
@@ -262,7 +246,7 @@ def load_flatfield():
                 if ref is not None:
                     _ff_gain = _gain_from_reference(ref)
             except Exception as e:
-                print(f"[Lưu ý] Không đọc được {FLATFIELD_PATH}: {e}")
+                print(f"[Notice] Could not read {FLATFIELD_PATH}: {e}")
     return _ff_gain
 
 
@@ -272,7 +256,7 @@ def _reset_flatfield_cache():
 
 
 def apply_flatfield(img_bgr):
-    """Nhân ảnh với bản đồ sáng. None = chưa có file tham chiếu."""
+    """Applies reference flat-field gain map. Returns None if reference is missing."""
     gain = load_flatfield()
     if gain is None:
         return None
@@ -287,15 +271,7 @@ def apply_flatfield(img_bgr):
 
 
 def _estimate_background(img, work=512, frac=3):
-    """Ước lượng ảnh NỀN: xoá vật đi, chỉ giữ lại độ dốc ánh sáng.
-
-    Phép ĐÓNG cửa sổ lớn nuốt trọn mọi thứ nhỏ hơn cửa sổ (tức là vật), chừa lại
-    nền. Tính trên ảnh thu nhỏ cho nhanh rồi phóng bản đồ lên — nền vốn biến
-    thiên rất thoai thoải nên không mất gì. Nhận cả ảnh xám lẫn ảnh màu.
-
-    frac: cửa sổ = cạnh ngắn / frac. Số càng NHỎ thì cửa sổ càng to, xoá được
-    vật càng lớn nhưng bám độ dốc ánh sáng càng thô.
-    """
+    """Estimates background illumination by morphological closing over objects."""
     h, w = img.shape[:2]
     s = min(1.0, float(work) / max(h, w))
     small = (cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))),
@@ -309,7 +285,7 @@ def _estimate_background(img, work=512, frac=3):
 
 
 def auto_flatten(img_bgr):
-    """Chưa có file tham chiếu: ước lượng nền ngay từ ảnh đang chụp rồi chia."""
+    """Estimates background directly from current frame and applies leveling."""
     bg = _estimate_background(img_bgr)
     target = float(np.percentile(bg, 98))
     gain = np.clip(target / np.maximum(bg, 1.0), 0.2, AUTO_MAX_GAIN)
@@ -317,11 +293,7 @@ def auto_flatten(img_bgr):
 
 
 def whiten_background(img_bgr):
-    """Kéo nền lên TRẮNG TINH: lấy độ sáng của nền làm mốc 255.
-
-    Sau khi san phẳng, nền đều nhưng thường còn xám (~230). image_to_gcode cắt
-    ngưỡng sáng nên nền càng sát trắng thì càng ít bị vẽ nhầm.
-    """
+    """Scales background level to pure white (255)."""
     if not WHITEN_BG:
         return img_bgr
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -335,27 +307,23 @@ def whiten_background(img_bgr):
 
 
 def flatten_illumination(img_bgr):
-    """San phẳng ánh sáng nền. Trả về (ảnh, tên cách đã dùng)."""
+    """Levels background illumination. Returns (image, method_name)."""
     if not FLATTEN_ILLUM:
-        return img_bgr, "tắt"
+        return img_bgr, "disabled"
     out = apply_flatfield(img_bgr)
-    mode = "file tham chiếu"
+    mode = "reference file"
     if out is None:
         if not AUTO_FLATTEN:
-            return img_bgr, "tắt"
+            return img_bgr, "disabled"
         out = auto_flatten(img_bgr)
-        mode = "tự ước lượng"
+        mode = "auto estimation"
     return whiten_background(out), mode
 
 
 def illumination_spread(img_bgr):
-    """Mức lệch sáng của NỀN (%): 0 = phẳng lì. Dùng để báo chất lượng đèn.
-
-    Đo trên ảnh nền đã ước lượng chứ không đo thẳng ảnh gốc — nếu không, đặt một
-    vật màu đen vào khung là con số vọt lên 80% dù đèn hoàn toàn đều.
-    """
+    """Background illumination variance (%): 0 = perfectly uniform."""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    bg = _estimate_background(gray, work=384, frac=2)   # cửa sổ to cho hết vật
+    bg = _estimate_background(gray, work=384, frac=2)
     lo, hi = float(np.percentile(bg, 2)), float(np.percentile(bg, 98))
     if hi < 1.0:
         return 100.0
@@ -363,7 +331,7 @@ def illumination_spread(img_bgr):
 
 
 def capture_flatfield(camera, pylon, base_img, cv2_bayer_code, n_frames=8):
-    """Chụp tấm NỀN TRẮNG TRỐNG (không có vật) làm bản đồ sáng tham chiếu."""
+    """Captures an EMPTY WHITE BACKGROUND (without objects) as illumination reference."""
     frames = [base_img.astype(np.float32)]
     for _ in range(max(0, n_frames - 1)):
         try:
@@ -382,27 +350,27 @@ def capture_flatfield(camera, pylon, base_img, cv2_bayer_code, n_frames=8):
     before = illumination_spread(ref)
 
     if not imwrite_unicode(FLATFIELD_PATH, ref):
-        print("[LỖI] Không ghi được file nền tham chiếu.")
+        print("[ERROR] Failed to save flat-field reference image.")
         return False
 
     _reset_flatfield_cache()
     after = illumination_spread(flatten_illumination(ref)[0])
 
     print("--------------------------------------------------")
-    print(f"[NỀN TRẮNG] Đã gộp {len(frames)} khung, lưu: {FLATFIELD_PATH}")
-    print(f" -> Lệch sáng nền: {before:.1f}%  =>  {after:.1f}% sau khi san phẳng")
+    print(f"[WHITE BACKGROUND] Merged {len(frames)} frames, saved: {FLATFIELD_PATH}")
+    print(f" -> Background illumination variance: {before:.1f}%  =>  {after:.1f}% after leveling")
     if before > 25:
-        print("(nền lệch hơn 25% — chỉnh đèn cho đều thì ảnh sẽ còn sạch hơn)")
-    print(" -> Từ giờ mọi ảnh chụp đều được san phẳng theo tấm nền này.")
+        print("(variance > 25% — adjust physical lights for better uniformity)")
+    print(" -> All future captures will be leveled using this reference background.")
     print("--------------------------------------------------")
     return True
 
 
 # ============================================================
-# HOẠT HÌNH HOÁ
+# CARTOONIZATION
 # ============================================================
 def _palette(img_bgr, k):
-    """Tìm k màu đại diện bằng k-means (chạy trên ảnh nhỏ cho nhanh)."""
+    """Finds k representative color centers using k-means."""
     Z = img_bgr.reshape(-1, 3).astype(np.float32)
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
     _, _, centers = cv2.kmeans(Z, max(2, k), None, crit, 3, cv2.KMEANS_PP_CENTERS)
@@ -410,7 +378,7 @@ def _palette(img_bgr, k):
 
 
 def _snap_to_palette(img_bgr, centers):
-    """Ép mọi điểm ảnh về màu gần nhất trong bảng màu -> mảng màu phẳng lì."""
+    """Maps every pixel to the nearest palette color."""
     f = img_bgr.astype(np.float32)
     best_d = None
     best_i = np.zeros(f.shape[:2], np.uint8)
@@ -426,7 +394,7 @@ def _snap_to_palette(img_bgr, centers):
 
 
 def _label_map(img_bgr, centers):
-    """Chỉ số màu gần nhất cho từng điểm ảnh (bản đồ mảng màu)."""
+    """Generates discrete label map indexing the closest palette center."""
     f = img_bgr.astype(np.float32)
     best_d = None
     lbl = np.zeros(f.shape[:2], np.uint8)
@@ -442,11 +410,7 @@ def _label_map(img_bgr, centers):
 
 
 def _merge_small_regions(lbl, min_area):
-    """Nuốt các mảng màu vụn vào mảng bao quanh nó.
-
-    Mảng vài chục pixel không vẽ được bằng bút mà chỉ sinh ra nét rác, nên gán
-    chúng theo nhãn của vùng lân cận đã giãn ra.
-    """
+    """Merges tiny color fragments into surrounding major regions."""
     if min_area <= 0:
         return lbl
     out = lbl.copy()
@@ -461,7 +425,6 @@ def _merge_small_regions(lbl, min_area):
         if not tiny.any():
             continue
         holes = tiny[comp]
-        # Lấy nhãn lân cận: giãn ảnh nhãn đã xoá vùng vụn rồi lấp vào chỗ trống
         filled = out.copy()
         filled[holes] = 255
         grown = cv2.dilate(np.where(holes, 0, out + 1).astype(np.uint8),
@@ -471,34 +434,27 @@ def _merge_small_regions(lbl, min_area):
 
 
 def _cartoon_parts(img_bgr):
-    """Lõi hoạt hình hoá -> (bảng màu, bản đồ mảng màu, mặt nạ nét viền).
-
-    Ba bước: (1) lọc song phương xoá vân bề mặt nhưng giữ nguyên biên, (2) gom
-    về vài mức màu bằng k-means, (3) dọn mảng vụn rồi lấy ranh giới làm nét.
-    Việc nặng làm trên ảnh thu nhỏ, bản đồ màu thì dựng ở cỡ gốc cho sắc nét.
-    """
+    """Core cartoonization -> (palette, label_map, edge_mask)."""
     h, w = img_bgr.shape[:2]
     s = min(1.0, float(CARTOON_WORK) / max(h, w))
     small = (cv2.resize(img_bgr, (max(1, int(w * s)), max(1, int(h * s))),
                         interpolation=cv2.INTER_AREA) if s < 1.0 else img_bgr)
 
-    # 1) Làm phẳng mà vẫn giữ biên
+    # 1) Edge-preserving smoothing
     for _ in range(max(1, CARTOON_SMOOTH)):
         small = cv2.bilateralFilter(small, 9, 75, 75)
 
-    # 2) Gom màu: lấy bảng màu ở ảnh nhỏ rồi ép cả ảnh gốc theo bảng đó, nhờ vậy
-    #    mảng màu phẳng ở đúng độ phân giải gốc chứ không bị răng cưa khi phóng.
+    # 2) Color clustering
     centers = _palette(small, CARTOON_LEVELS)
     base = cv2.bilateralFilter(img_bgr, 9, 60, 60) if s < 1.0 else small
     lbl = _label_map(base, centers)
 
-    # 3) Dọn bản đồ mảng màu: lọc trung vị xoá đốm + làm mượt biên, rồi nuốt nốt
-    #    các mảng còn quá nhỏ. Đây mới là chỗ quyết định nét ra ít hay nhiều.
+    # 3) Clean label map
     if CARTOON_CLEAN >= 3:
         lbl = cv2.medianBlur(lbl, CARTOON_CLEAN | 1)
     lbl = _merge_small_regions(lbl, CARTOON_MIN_AREA)
 
-    # 4) Nét viền = RANH GIỚI giữa các mảng màu (kín sẵn, không có đốm rác)
+    # 4) Boundary edges between color clusters
     ink = (cv2.morphologyEx(lbl, cv2.MORPH_GRADIENT,
                             np.ones((3, 3), np.uint8)) > 0).astype(np.uint8) * 255
     if CARTOON_EDGE_THICK > 1:
@@ -507,7 +463,7 @@ def _cartoon_parts(img_bgr):
 
 
 def cartoonize(img_bgr):
-    """Tranh hoạt hình CÓ MÀU: mảng màu phẳng + nét viền đen. Để xem/đối chiếu."""
+    """Color cartoon: flat color regions + dark boundary outlines."""
     centers, lbl, ink = _cartoon_parts(img_bgr)
     out = centers[lbl].astype(np.uint8)
     out[ink > 0] = (0, 0, 0)
@@ -515,12 +471,7 @@ def cartoonize(img_bgr):
 
 
 def line_art(img_bgr):
-    """CHỈ CÒN NÉT: nền trắng, viền đen — đúng thứ máy vẽ một bút cần.
-
-    Bản có màu không dùng thẳng được: image_to_gcode cắt theo ĐỘ SÁNG nên nó tô
-    cả mảng màu đậm chứ không đi theo viền. Tách riêng lớp nét ra thì phương
-    pháp 'line'/'contour' bám đúng từng đường một.
-    """
+    """Line art only: white background with crisp black outlines for pen plotters."""
     _, _, ink = _cartoon_parts(img_bgr)
     out = np.full(img_bgr.shape, 255, np.uint8)
     out[ink > 0] = (0, 0, 0)
@@ -528,16 +479,16 @@ def line_art(img_bgr):
 
 
 def _fill_holes(mask):
-    """Lấp lỗ bên trong mảng trắng (mắt, chi tiết sáng giữa vật)."""
+    """Fills internal holes inside white regions."""
     h, w = mask.shape
     flood = mask.copy()
     tmp = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, tmp, (0, 0), 255)      # tô nền ngoài thành trắng
+    cv2.floodFill(flood, tmp, (0, 0), 255)
     return cv2.bitwise_or(mask, cv2.bitwise_not(flood))
 
 
 def _keep_main_blobs(mask, min_area):
-    """Giữ các mảng đủ lớn; ưu tiên mảng KHÔNG chạm mép ảnh (vật nằm giữa khung)."""
+    """Retains major blobs, prioritizing objects centered within the frame."""
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         (mask > 0).astype(np.uint8), connectivity=8)
     if n <= 1:
@@ -559,7 +510,7 @@ def _keep_main_blobs(mask, min_area):
 
 
 def _refine_grabcut(img_bgr, mask, iters=3, max_dim=480):
-    """Bám sát biên thật của vật bằng GrabCut, khởi tạo từ mặt nạ thô."""
+    """Refines object boundaries using GrabCut initialized from initial mask."""
     h, w = mask.shape
     scale = min(1.0, float(max_dim) / max(h, w))
     if scale < 1.0:
@@ -573,11 +524,11 @@ def _refine_grabcut(img_bgr, mask, iters=3, max_dim=480):
     gc[m > 0] = cv2.GC_PR_FGD
     sure = cv2.erode(m, np.ones((5, 5), np.uint8))
     gc[sure > 0] = cv2.GC_FGD
-    gc[:2, :] = gc[-2:, :] = cv2.GC_BGD      # viền ảnh chắc chắn là nền
+    gc[:2, :] = gc[-2:, :] = cv2.GC_BGD      # Frame borders are guaranteed background
     gc[:, :2] = gc[:, -2:] = cv2.GC_BGD
 
     if not (gc == cv2.GC_FGD).any():
-        return mask                           # không đủ dữ liệu -> giữ mặt nạ cũ
+        return mask
     try:
         cv2.grabCut(small, gc, None, np.zeros((1, 65), np.float64),
                     np.zeros((1, 65), np.float64), iters, cv2.GC_INIT_WITH_MASK)
@@ -592,12 +543,7 @@ def _refine_grabcut(img_bgr, mask, iters=3, max_dim=480):
 
 
 def illum_field(L, seed, work=512):
-    """Trường ánh sáng của tấm ảnh — CÓ TÍNH CẢ BÓNG ĐỔ, đã bỏ vùng vật ra.
-
-    seed: mặt nạ vùng chắc chắn là VẬT. Chỗ đó bị che đi rồi trám lại bằng nội
-    suy từ nền xung quanh, nên vật không kéo trường sáng xuống theo. Làm mượt
-    vừa phải: đủ để xoá vân bề mặt nhưng vẫn bám được độ dốc của vùng nửa tối.
-    """
+    """Constructs light field including cast shadows while masking object regions."""
     h, w = L.shape[:2]
     s = min(1.0, float(work) / max(h, w))
     if s < 1.0:
@@ -607,7 +553,7 @@ def illum_field(L, seed, work=512):
     else:
         Ls, ms = L, seed
 
-    ms = cv2.dilate(ms, np.ones((7, 7), np.uint8))   # nới ra cho hết mép vật
+    ms = cv2.dilate(ms, np.ones((7, 7), np.uint8))
     if cv2.countNonZero(ms) and cv2.countNonZero(255 - ms):
         Ls = cv2.inpaint(Ls, ms, 7, cv2.INPAINT_TELEA)
     field = cv2.GaussianBlur(Ls.astype(np.float32), (0, 0), SHADOW_SMOOTH)
@@ -617,21 +563,12 @@ def illum_field(L, seed, work=512):
 
 
 def object_mask(img_bgr):
-    """Mặt nạ VẬT (255) / nền (0), bỏ qua bóng đổ.
-
-    Hai dấu hiệu độc lập, lấy hợp của cả hai:
-      1. LỆCH MÀU so với nền — bóng đổ chỉ làm TỐI chứ gần như không đổi màu,
-         nên vật có màu (dù nhạt) vẫn tách được kể cả khi đèn rọi mạnh.
-      2. TỐI HƠN HẲN nền SAU KHI đã san phẳng ánh sáng — bắt vật đen/xám không
-         có màu. San phẳng bằng cách chia cho ảnh nền ước lượng (phép ĐÓNG cửa
-         sổ lớn), nhờ vậy vùng sáng không đều và bóng đổ thoai thoải bị triệt
-         tiêu, chỉ còn thứ thật sự tối hơn môi trường quanh nó.
-    """
+    """Generates binary mask for OBJECT (255) / background (0), suppressing cast shadows."""
     h, w = img_bgr.shape[:2]
     lab = cv2.cvtColor(cv2.GaussianBlur(img_bgr, (0, 0), 1.2), cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
 
-    # --- 1) Lệch màu so với nền (lấy mẫu nền ở VIỀN ảnh) ---
+    # 1. Color divergence from background sampled at image borders
     band = max(4, int(min(h, w) * 0.04))
     border = np.zeros((h, w), bool)
     border[:band, :] = True
@@ -643,17 +580,14 @@ def object_mask(img_bgr):
     chroma = np.hypot(A.astype(np.float32) - a_bg, B.astype(np.float32) - b_bg)
     mask_color = chroma > OBJ_CHROMA_THR
 
-    # --- 2) Tối hơn nền sau khi san phẳng ánh sáng ---
+    # 2. Luminance deficit relative to background after leveling
     k = max(31, (min(h, w) // 6) | 1)
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    bg = cv2.morphologyEx(L, cv2.MORPH_CLOSE, se)      # xoá vật, giữ nền + bóng
+    bg = cv2.morphologyEx(L, cv2.MORPH_CLOSE, se)
     bg = cv2.GaussianBlur(bg, (0, 0), k / 6.0)
     ratio = L.astype(np.float32) / np.maximum(bg.astype(np.float32), 1.0)
 
     if REMOVE_SHADOW:
-        # Dựng lại trường sáng có tính cả bóng, lấy mồi là vùng CHẮC CHẮN là vật:
-        # chỗ lệch màu (bóng không đổi màu nên không lọt vào) cộng chỗ tối đậm
-        # quá mức một cái bóng khuếch tán có thể gây ra.
         seed = ((mask_color | (ratio < SHADOW_SEED_RATIO)).astype(np.uint8)) * 255
         seed = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
         field = illum_field(L, seed)
@@ -662,7 +596,7 @@ def object_mask(img_bgr):
     mask_dark = ratio < OBJ_DARK_RATIO
     mask = ((mask_color | mask_dark).astype(np.uint8)) * 255
 
-    # --- 3) Dọn dẹp: nối nét đứt, xoá đốm, lấp lỗ, giữ mảng chính ---
+    # 3. Cleanup: bridge gaps, remove speckles, fill holes, retain main blob
     k3 = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3, iterations=1)
@@ -676,13 +610,7 @@ def object_mask(img_bgr):
 
 
 def extract_object_on_white(img_bgr, mask_src=None):
-    """Cắt vật ra khỏi nền rồi dán lên nền TRẮNG TINH.
-
-    mask_src: ảnh dùng để TÌM vật (nên đưa ảnh gộp khung chưa làm nét — sạch
-    nhiễu hơn); vật thì vẫn được cắt từ img_bgr (ảnh đã làm nét).
-    Trả về (ảnh_nền_trắng, mặt_nạ, tỉ_lệ_diện_tích) hoặc (None, mask, tỉ lệ)
-    nếu không tách được.
-    """
+    """Isolates object and pastes it onto a pure WHITE background."""
     h, w = img_bgr.shape[:2]
     src = img_bgr if mask_src is None else mask_src
     if src.shape[:2] != (h, w):
@@ -691,7 +619,6 @@ def extract_object_on_white(img_bgr, mask_src=None):
     mask = object_mask(src)
     coverage = cv2.countNonZero(mask) / float(h * w)
 
-    # Quá ít = không thấy vật; quá nhiều = bắt nhầm cả nền -> báo để chỉnh ngưỡng
     if coverage < 0.0005 or coverage > 0.9:
         return None, mask, coverage
 
@@ -702,7 +629,6 @@ def extract_object_on_white(img_bgr, mask_src=None):
     out = (img_bgr.astype(np.float32) * alpha3 + 255.0 * (1.0 - alpha3))
     out = np.clip(out, 0, 255).astype(np.uint8)
 
-    # Cắt sát vật (chừa lề) -> image_to_gcode phóng vật ra kín vùng vẽ
     if OBJ_CROP_MARGIN >= 0:
         ys, xs = np.nonzero(mask)
         m = int(OBJ_CROP_MARGIN)
@@ -715,13 +641,12 @@ def extract_object_on_white(img_bgr, mask_src=None):
 
 def capture_and_save(camera, pylon, base_img, cv2_bayer_code):
     """
-    Chụp ảnh sạch (không có chữ overlay), gộp nhiều khung để khử nhiễu,
-    làm nét tự động, rồi TÁCH VẬT DÁN LÊN NỀN TRẮNG để cắt G-Code cho sạch.
-    Lưu 3 file: _raw (gốc), _sharp (đã làm nét), _object (vật trên nền trắng).
+    Captures clean image (without overlay), averages frames for denoising,
+    sharpens automatically, and isolates object onto pure white background.
+    Saves: _raw (original), _sharp (enhanced), _object (object on white).
     """
     os.makedirs(CAPTURE_DIR, exist_ok=True)
 
-    # Gộp trung bình nhiều khung liên tiếp -> giảm nhiễu cảm biến (cảnh phải đứng yên)
     frames = [base_img.astype(np.float32)]
     for _ in range(max(0, CAPTURE_AVG_FRAMES - 1)):
         try:
@@ -738,8 +663,6 @@ def capture_and_save(camera, pylon, base_img, cv2_bayer_code):
 
     raw_img = np.clip(np.mean(frames, axis=0), 0, 255).astype(np.uint8)
 
-    # SAN PHẲNG ÁNH SÁNG trước mọi bước khác: mọi xử lý sau đều so theo độ sáng,
-    # nên nền phải đều trước thì tìm vật và cắt ngưỡng mới chuẩn.
     spread_before = illumination_spread(raw_img)
     flat_img, flat_mode = flatten_illumination(raw_img)
     spread_after = illumination_spread(flat_img)
@@ -755,43 +678,38 @@ def capture_and_save(camera, pylon, base_img, cv2_bayer_code):
     imwrite_unicode(sharp_path, sharp_img)
 
     print("--------------------------------------------------")
-    print(f"[CHỤP ẢNH] Gộp {len(frames)} khung hình để khử nhiễu.")
-    print(f" -> San phẳng nền ({flat_mode}): lệch sáng "
+    print(f"[CAPTURE] Merged {len(frames)} frames for noise reduction.")
+    print(f" -> Background leveling ({flat_mode}): variance "
           f"{spread_before:.1f}% => {spread_after:.1f}%")
-    if flat_mode == "tự ước lượng":
-        print("(nhấn 'f'khi khung hình chỉ có NỀN TRẮNG TRỐNG để chuẩn cho chính xác)")
-    print(f" -> Độ nét: {score_before:.1f}  =>  {score_after:.1f} (cường độ làm nét: {amount:.1f})")
-    print(f" -> Ảnh gốc   : {raw_path}")
-    print(f" -> Ảnh đã nét: {sharp_path}")
+    if flat_mode == "auto estimation":
+        print("(press 'f' when frame has EMPTY WHITE BACKGROUND for accurate calibration)")
+    print(f" -> Sharpness: {score_before:.1f} => {score_after:.1f} (sharpen strength: {amount:.1f})")
+    print(f" -> Raw image  : {raw_path}")
+    print(f" -> Sharp image: {sharp_path}")
 
-    # --- Tách vật khỏi nền, dán lên nền trắng (ảnh dùng để cắt G-Code) ---
-    # Tìm vật trên ảnh CHƯA làm nét: CLAHE + unsharp đẩy cả nhiễu nền lên,
-    # dò trên ảnh sạch cho biên chuẩn hơn. Vật thì vẫn cắt từ ảnh đã làm nét.
     result_path = sharp_path
     show_img = sharp_img
     if EXTRACT_OBJECT:
         obj_img, mask, coverage = extract_object_on_white(sharp_img, mask_src=flat_img)
         if obj_img is None:
-            print(f" -> [!] KHÔNG tách được vật (chiếm {coverage*100:.2f}% khung hình).")
-            print("Vật nhạt màu quá thì GIẢM OBJ_CHROMA_THR; "
-                  "bắt nhầm nền thì TĂNG.")
+            print(f" -> [!] FAILED to extract object ({coverage*100:.2f}% of frame).")
+            print("If object is too pale, DECREASE OBJ_CHROMA_THR; if background is captured, INCREASE.")
         else:
             obj_path = os.path.join(CAPTURE_DIR, f"capture_{stamp}_object.png")
             imwrite_unicode(obj_path, obj_img)
             oh, ow = obj_img.shape[:2]
-            print(f" -> Vật/nền trắng: {obj_path}")
-            print(f"(vật chiếm {coverage*100:.1f}% khung, ảnh cắt ra {ow}x{oh} px)")
+            print(f" -> Object/white bg: {obj_path}")
+            print(f"(object covers {coverage*100:.1f}% of frame, cropped to {ow}x{oh} px)")
             result_path = obj_path
             show_img = obj_img
 
-    print(f" -> Dùng convert_3d_to_2d.py để chuyển ảnh 3D → 2D trước khi đưa")
-    print(f"vào image_to_gcode.py tạo G-Code.")
+    print(f" -> Use convert_3d_to_2d.py to convert 3D → 2D before")
+    print(f"generating G-Code in image_to_gcode.py.")
     print("--------------------------------------------------")
 
-    # Xem trước kết quả trong cửa sổ riêng
     h, w = show_img.shape[:2]
     scale = UI_SCALE if max(h, w) * UI_SCALE > 240 else min(1.0, 480.0 / max(h, w))
-    cv2.imshow("Anh da chup (vat tren nen trang)",
+    cv2.imshow("Captured Image (Object on White Background)",
                fit_display(show_img, scale, chrome_h=60))
 
     return result_path
@@ -800,47 +718,47 @@ def capture_and_save(camera, pylon, base_img, cv2_bayer_code):
 def main():
     global current_exposure_ms, current_gain, auto_exposure_enabled, color_mode_idx
     print("==================================================")
-    print("BASLER GIGE CAMERA - STREAMING & KẾT NỐI CTRLX")
+    print("BASLER GIGE CAMERA - STREAMING & CTRLX PIPELINE")
     print("==================================================")
 
     try:
         from pypylon import pylon
     except ImportError:
-        print("[LỖI] Thư viện 'pypylon'chưa được cài đặt. Vui lòng chạy: pip install pypylon")
+        print("[ERROR] 'pypylon' library is not installed. Please run: pip install pypylon")
         return
 
     tl_factory = pylon.TlFactory.GetInstance()
     devices = tl_factory.EnumerateDevices()
 
     if not devices:
-        print("[LỖI] Không tìm thấy camera Basler GigE nào trên dải mạng!")
+        print("[ERROR] No Basler GigE camera found on the network!")
         return
 
     dev_info = devices[0]
-    print(f"[KẾT NỐI] Đã tìm thấy camera: {dev_info.GetFriendlyName()} ({dev_info.GetIpAddress()})\n")
+    print(f"[CONNECT] Camera found: {dev_info.GetFriendlyName()} ({dev_info.GetIpAddress()})\n")
 
     try:
         camera = pylon.InstantCamera(tl_factory.CreateDevice(dev_info))
         camera.Open()
-        
-        # Cấu hình gói tin mạng GigE tối ưu
+
+        # Optimize GigE network packet size
         try:
             if hasattr(camera, 'GevSCPSPacketSize'):
                 camera.GevSCPSPacketSize.SetValue(1440)
         except Exception:
             pass
 
-        # TẮT TỰ ĐỘNG PHƠI SÁNG ĐỂ ÁNH SÁNG VẬT LÝ VÀ ĐÈN CHIẾU NGOÀI ĐỜI HOẠT ĐỘNG CHUẨN
+        # Disable auto exposure for consistent physical lighting
         try:
             if hasattr(camera, 'ExposureAuto'):
                 camera.ExposureAuto.SetValue("Off")
             if hasattr(camera, 'GainAuto'):
                 camera.GainAuto.SetValue("Off")
-            print(" -> [CHẾ ĐỘ THỦ CÔNG] Đã tắt Auto Exposure & Gain (Tùy chỉnh ánh sáng vật lý trực tiếp).")
+            print(" -> [MANUAL MODE] Auto Exposure & Gain disabled (direct physical lighting adjustment).")
         except Exception as e:
-            print(f" [Lưu ý phơi sáng]: {e}")
+            print(f" [Exposure notice]: {e}")
 
-        # Cân bằng trắng an toàn
+        # Safe white balance
         try:
             if hasattr(camera, 'BalanceWhiteAuto'):
                 camera.BalanceWhiteAuto.SetValue("Once")
@@ -848,12 +766,10 @@ def main():
             pass
 
         camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
-        
+
         window_name = "Basler GigE Camera Stream"
         cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
-        # Thanh trượt tinh chỉnh tinh gọn — vị trí ban đầu lấy thẳng từ các biến
-        # mặc định ở đầu file, khỏi phải sửa hai nơi mà lệch nhau.
         cv2.createTrackbar("Auto Exposure (1=ON, 0=OFF)", window_name,
                            auto_exposure_enabled, 1, on_auto_exposure_change)
         cv2.createTrackbar("Exposure (ms)", window_name,
@@ -863,51 +779,44 @@ def main():
         cv2.createTrackbar("Color Mode (0-7)", window_name,
                            color_mode_idx, 7, on_color_mode_change)
 
-        # Neo cửa sổ vào góc trên trái để không mở lệch ra ngoài màn hình
         try:
             cv2.moveWindow(window_name, 0, 0)
         except Exception:
             pass
 
-        print("[HƯỚNG DẪN]:")
-        print(" - Giao diện tự động thu gọn cho vừa màn hình.")
-        print(" - LÀM MỘT LẦN: để khung hình chỉ có NỀN TRẮNG TRỐNG rồi nhấn 'f'")
-        print("để chuẩn độ sáng nền. Chỉ cần chuẩn lại khi đổi đèn/ống kính/khoảng cách.")
-        print(" - Nhấn 'n'để xem thử khung hình sau khi san phẳng.")
-        print(" - Kéo thanh 'Color Mode (0-7)'hoặc nhấn 'c'để chuyển màu sắc.")
-        print(" - Nhấn 's'hoặc PHÍM CÁCH để CHỤP ẢNH.")
-        print("Sau khi chụp: gộp khung khử nhiễu -> làm rõ nét -> TÁCH VẬT")
-        print("dán lên NỀN TRẮNG (file *_object.png) để cắt G-Code không dính bóng.")
-        print(f"Ảnh được lưu vào thư mục: {CAPTURE_DIR}")
-        print(" - Nhấn 'q'hoặc 'ESC'để thoát.\n")
+        print("[INSTRUCTIONS]:")
+        print(" - UI automatically scales to fit screen.")
+        print(" - RUN ONCE: place an EMPTY WHITE BACKGROUND in frame, then press 'f'")
+        print("   to calibrate background illumination. Only recalibrate when changing lights/lens/distance.")
+        print(" - Press 'n' to toggle flat-field preview on live stream.")
+        print(" - Adjust 'Color Mode (0-7)' slider or press 'c' to cycle color modes.")
+        print(" - Press 's' or SPACEBAR to CAPTURE IMAGE.")
+        print("   Post-capture: average frames -> sharpen -> EXTRACT OBJECT")
+        print("   onto WHITE BACKGROUND (*_object.png) to eliminate shadows for G-Code.")
+        print(f"   Images saved to directory: {CAPTURE_DIR}")
+        print(" - Press 'q' or 'ESC' to exit.\n")
 
         last_auto_state = -1
         last_capture_time = 0.0
-        last_flat_time = 0.0       # lần chuẩn nền gần nhất (để nhấp nháy báo)
-        preview_flat = load_flatfield() is not None   # có file chuẩn thì xem luôn
-        last_exposure_ms = None    # giá trị đã ghi xuống camera lần gần nhất
+        last_flat_time = 0.0
+        preview_flat = load_flatfield() is not None
+        last_exposure_ms = None
         last_gain = None
-        exp_readback = None        # số phơi sáng đọc về (None = cần đọc lại)
-        last_exp_read = 0.0        # lần đọc gần nhất (dùng ở chế độ Auto)
-        timeout_count = 0          # đếm số lần liên tiếp không nhận được frame
+        exp_readback = None
+        last_exp_read = 0.0
+        timeout_count = 0
 
         while camera.IsGrabbing():
-            # XỬ LÝ SỰ KIỆN CỬA SỔ TRƯỚC — tránh "Not Responding"
-            # cv2.waitKey phải luôn được gọi ở mỗi vòng lặp, kể cả khi
-            # camera chưa gửi frame. Không gọi → Windows coi cửa sổ đã treo.
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:   # 'q' hoặc ESC
+            if key == ord('q') or key == 27:   # 'q' or ESC
                 break
             elif key == ord('n'):
                 preview_flat = not preview_flat
-                print(f"[XEM THỬ] San phẳng trên khung hình live: "
-                      f"{'BẬT' if preview_flat else 'TẮT'}")
+                print(f"[PREVIEW] Flat-field correction on live frame: "
+                      f"{'ON' if preview_flat else 'OFF'}")
 
-            # Xử lý bật/tắt Auto Exposure linh hoạt
             if auto_exposure_enabled != last_auto_state:
                 last_auto_state = auto_exposure_enabled
-                # Auto vừa chỉnh lại phơi sáng/gain trong camera, nên khi quay về
-                # thủ công phải GHI LẠI giá trị thanh trượt dù nó không đổi.
                 last_exposure_ms = None
                 last_gain = None
                 exp_readback = None
@@ -924,9 +833,6 @@ def main():
                     except Exception:
                         pass
 
-            # Nếu tắt Auto, cập nhật thông số thủ công từ thanh trượt.
-            # CHỈ ghi khi giá trị THAY ĐỔI: mỗi lệnh SetValue là một lượt hỏi/đáp
-            # qua mạng GigE, ghi lại mỗi khung hình sẽ làm stream giật và tụt FPS.
             if auto_exposure_enabled == 0:
                 if current_exposure_ms != last_exposure_ms:
                     last_exposure_ms = current_exposure_ms
@@ -940,7 +846,7 @@ def main():
                             camera.ExposureTime.SetValue(float(us_val))
                     except Exception:
                         pass
-                    exp_readback = None      # buộc đọc lại số hiển thị
+                    exp_readback = None
 
                 if current_gain != last_gain:
                     last_gain = current_gain
@@ -952,75 +858,57 @@ def main():
                     except Exception:
                         pass
             else:
-                # Chế độ Auto: camera tự đổi phơi sáng -> đọc lại số hiển thị,
-                # nhưng giãn ra 0.5s một lần cho đỡ nghẽn đường truyền.
                 if time.time() - last_exp_read > 0.5:
                     last_exp_read = time.time()
                     exp_readback = None
 
-            # TIMEOUT NGẮN + KHÔNG THROW — cửa sổ không bao giờ bị treo.
-            # Thay vì chờ 5 giây rồi throw exception (cửa sổ đông cứng suốt
-            # thời gian chờ), dùng timeout 500ms + Return: nếu không có frame
-            # thì quay lại đầu vòng lặp gọi waitKey cho cửa sổ vẫn responsive.
             try:
                 grabResult = camera.RetrieveResult(500, pylon.TimeoutHandling_Return)
             except Exception as e:
-                print(f"[LỖI GRAB]: {e}")
+                print(f"[GRAB ERROR]: {e}")
                 timeout_count += 1
                 if timeout_count > 20:
-                    print("[LỖI] Mất kết nối camera — đang thử kết nối lại...")
+                    print("[ERROR] Camera connection lost — attempting to reconnect...")
                     try:
                         camera.StopGrabbing()
                         time.sleep(1)
                         camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
                         timeout_count = 0
-                        print("[OK] Đã kết nối lại camera.")
+                        print("[OK] Camera reconnected.")
                     except Exception as e2:
-                        print(f"[LỖI] Không thể kết nối lại: {e2}")
+                        print(f"[ERROR] Could not reconnect: {e2}")
                         break
                 continue
 
             if not grabResult.IsValid() or not grabResult.GrabSucceeded():
-                # Không nhận được frame — hiển thị thông báo chờ
                 timeout_count += 1
                 if grabResult.IsValid():
                     grabResult.Release()
                 if timeout_count == 1 or timeout_count % 10 == 0:
-                    print(f"[CHỜ] Chưa nhận được frame từ camera... "
-                          f"(lần {timeout_count})")
-                # Nếu timeout quá lâu (>10 giây liên tục): thử reset stream
+                    print(f"[WAIT] Waiting for camera frame... (attempt {timeout_count})")
                 if timeout_count > 20:
-                    print("[CẢNH BÁO] Camera không gửi frame — đang thử kết nối lại...")
+                    print("[WARNING] Camera not sending frames — attempting to reconnect...")
                     try:
                         camera.StopGrabbing()
                         time.sleep(1)
                         camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
                         timeout_count = 0
-                        print("[OK] Đã khởi động lại stream.")
+                        print("[OK] Stream restarted.")
                     except Exception as e:
-                        print(f"[LỖI] Reset stream thất bại: {e}")
+                        print(f"[ERROR] Stream reset failed: {e}")
                         break
                 continue
 
-            # Nhận được frame thành công
             timeout_count = 0
 
             try:
-                # Lấy chế độ giải mã màu hiện tại
                 mode_name, cv2_bayer_code = BAYER_MODES[color_mode_idx]
-
-                # Ảnh SẠCH (không chữ overlay) - dùng để chụp và lưu
                 img_bgr = raw_to_bgr(grabResult.Array, cv2_bayer_code)
 
-                # Ảnh để hiển thị: THU NHỎ TRƯỚC rồi mới vẽ chữ lên. Vẽ ở cỡ gốc
-                # rồi mới thu nhỏ thì chữ bị co lại còn vài pixel, không đọc nổi.
                 view = fit_display(img_bgr)
                 if preview_flat:
                     view = flatten_illumination(view)[0]
 
-                # Hiển thị thông số trên góc hình ảnh.
-                # Đọc lại từ camera là một lượt hỏi/đáp qua mạng nữa -> chỉ đọc
-                # khi vừa đổi thông số, còn lại dùng số đã nhớ.
                 if exp_readback is None:
                     exp_readback = float(current_exposure_ms)
                     try:
@@ -1032,12 +920,11 @@ def main():
                         pass
                 exp_val = exp_readback
 
-                # Trạng thái nền: có file chuẩn hay đang phải tự đoán
                 if load_flatfield() is not None:
-                    flat_txt = "FLAT: da chuan" + (" [xem thu]" if preview_flat else "")
+                    flat_txt = "FLAT: calibrated" + (" [preview]" if preview_flat else "")
                     flat_col = (0, 255, 0)
                 else:
-                    flat_txt = "FLAT: chua chuan - nhan 'f' khi nen TRONG"
+                    flat_txt = "FLAT: not calibrated - press 'f' on EMPTY background"
                     flat_col = (0, 200, 255)
 
                 status_text = f"Exp: {exp_val:.1f}ms | Gain: {current_gain} | Mode [{color_mode_idx}]: {mode_name}"
@@ -1047,50 +934,49 @@ def main():
                 cv2.putText(view, flat_txt, (10, 44),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, flat_col, 1, cv2.LINE_AA)
 
-                # Thông báo nhấp nháy 2 giây sau khi chụp xong
                 if time.time() - last_capture_time < 2.0:
-                    cv2.putText(view, "DA CHUP + LAM NET!", (10, 70),
+                    cv2.putText(view, "CAPTURED + SHARPENED!", (10, 70),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
                 if time.time() - last_flat_time < 2.0:
-                    cv2.putText(view, "DA CHUAN NEN TRANG!", (10, 70),
+                    cv2.putText(view, "CALIBRATED WHITE BACKGROUND!", (10, 70),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
                 cv2.imshow(window_name, view)
 
-                # Phím tắt chụp ảnh và chuẩn nền (phải có frame mới xử lý được)
                 if key == ord('c'):
                     color_mode_idx = (color_mode_idx + 1) % len(BAYER_MODES)
                     cv2.setTrackbarPos("Color Mode (0-7)", window_name, color_mode_idx)
-                elif key == ord('s') or key == 32:  # 's' hoặc PHÍM CÁCH = chụp ảnh
+                elif key == ord('s') or key == 32:  # 's' or SPACE = capture
                     grabResult.Release()
                     grabResult = None
                     try:
                         capture_and_save(camera, pylon, img_bgr, cv2_bayer_code)
                         last_capture_time = time.time()
                     except Exception as e:
-                        print(f"[LỖI CHỤP ẢNH]: {e}")
-                elif key == ord('f'):   # chuẩn nền trắng (khung hình phải TRỐNG)
+                        print(f"[CAPTURE ERROR]: {e}")
+                elif key == ord('f'):   # Calibrate background (frame must be EMPTY)
                     grabResult.Release()
                     grabResult = None
                     try:
                         if capture_flatfield(camera, pylon, img_bgr, cv2_bayer_code):
                             last_flat_time = time.time()
-                            preview_flat = True   # bật xem thử để thấy ngay kết quả
+                            preview_flat = True
                     except Exception as e:
-                        print(f"[LỖI CHUẨN NỀN]: {e}")
+                        print(f"[CALIBRATION ERROR]: {e}")
 
             except Exception as e:
-                print(f"[LỖI XỬ LÝ FRAME]: {e}")
+                print(f"[FRAME PROCESSING ERROR]: {e}")
 
             if grabResult is not None:
                 grabResult.Release()
 
         camera.Close()
         cv2.destroyAllWindows()
-        print("Đã đóng kết nối camera an toàn.")
+        print("Closed camera connection safely.")
 
     except Exception as e:
-        print(f"[LỖI]: {e}")
+        print(f"[ERROR]: {e}")
+
 
 if __name__ == "__main__":
     main()
